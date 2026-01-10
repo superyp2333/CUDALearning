@@ -41,5 +41,5 @@ git fetch
 
 每周30小时的GPU
 
-<img src="./assets/image-20260110172228083.png" alt="image-20260110172228083" style="zoom: 50%;" />
+<img src="./assets/image-20260110172228083.png" width="60%" />
 
