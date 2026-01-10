@@ -37,9 +37,13 @@ git fetch
 
 获取免费的GPU环境：[Kaggle](https://www.kaggle.com/)
 
-![image-20260110171544563](./assets/image-20260110171544563.png)
+<img src="./assets/image-20260110171544563.png" alt="image-20260110171544563" />
 
-每周30小时的GPU
+手动关闭后台任务，否则GPU一直在占用，很快就把每周30小时的GPU额度用完了
 
-<img src="./assets/image-20260110172228083.png" width="60%" />
+<img src="./assets/image-20260110172228083.png" alt="image-20260110172228083.png" width="60%" />
+
+查看每周剩余的GPU额度：头像 -> settings -> Quotas
+
+<img src="./assets/image-20260111144127561.png" alt="image-20260111144127561" width="60%" />
 
