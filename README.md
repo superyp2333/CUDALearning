@@ -360,3 +360,7 @@ kernel_function<<<gird_size, block_size>>>();
 ```
 
 ![image-20260118204214952](./assets/image-20260118204214952.png)
+
+✅ **所有维度网格的线程索引计算方式**
+
+![image-20260118204841527](C:\Users\14567\AppData\Roaming\Typora\typora-user-images\image-20260118204841527.png)
