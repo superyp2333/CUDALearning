@@ -424,3 +424,19 @@ Warp Divergence 是 SIMT（单指令多线程）模式下的特有现象：
 4. 分支外提（把分支移到 Warp/Block 级别）
 5. 用 CUDA 内置函数 / 编译器优化
 
+## 四、算子实战
+
+### 4.1 简单的程序
+
+[点击查看完整代码：tensor_add.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/tensor_add.cu)
+
+
+
+
+
+
+
+
+
+
+
