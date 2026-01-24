@@ -124,16 +124,22 @@ int main()
 
 <img src="./assets/image-20260111160415399.png" alt="image-20260111160415399" width="60%"/>
 
+也可以将文件上传至Kaggle，然后通过命令行去编译&运行
+
+<img src="./assets/image-20260124201738296.png" alt="image-20260124201738296" width="40%;" />
+
+<img src="./assets/image-20260124201931073.png" alt="image-20260124201931073" width="50%"/>
+
 
 
 ✨ Tips：正常的编译和运行过程如下
 
 ```bash
-# 假设 CUDA 代码写在 main.cu 中，则如下命令可以编译生成一个文件名为 main 的可执行文件
-nvcc main.cu -o main
+# 假设 CUDA 代码写在 XXX.cu 中，则如下命令可以编译生成一个文件名为 XXX 的可执行文件
+nvcc XXX.cu -o XXX
 
 # 运行 CUDA 代码
-./main
+./XXX
 ```
 
 
@@ -428,15 +434,194 @@ Warp Divergence 是 SIMT（单指令多线程）模式下的特有现象：
 
 ### 4.1 简单的程序
 
-[点击查看完整代码：tensor_add.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/tensor_add.cu)
+[tensor_add.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/tensor_add.cu)
 
+<img src="./assets/image-20260124174036619.png" alt="image-20260124174036619.png" width="40%"/>
 
+### 4.2 Pytorch 接口
 
+> CUDA Kernel 主要是在 Pytorch 场景中调用，因此可以学习一下用 Python 的方式去调用 Kernel
 
+以 Relu 激活函数为例：`y = max(0, x)`
 
+* 计算精度：FP32，单精度
+* 计算策略：每个线程只处理一个元素
+* 输入向量 x 的维度：N
+* 输出向量 y 的维度：N
+* 线程模型：每个 block `256` 个线程，则共需要 `N/256` 个 block
 
+[relu.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/relu/relu.cu)
 
+[relu.py](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/relu/relu.py)
 
+✅ **导入头文件**
 
+```cpp
+#include <algorithm>
+#include <cuda_fp16.h> // CUDA 半精度浮点型（FP16/half） 相关类型和操作
+#include <cuda_runtime.h> // CUDA 运行时 API 的所有核心声明
+#include <float.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <torch/extension.h> // 连接 Python 端 PyTorch 和 C++/CUDA 代码的桥梁
+#include <torch/types.h> // 定义 PyTorch C++ 接口的基础类型
+#include <vector>
+```
 
+✅ **编写 Kernel**
 
+```cpp
+// FP32
+// x: N  y:N
+// y = max(0, N)
+// block(256)  grid(N/256)
+__global__ relu_f32_kernel(float *x, float *y, const int N) {
+    // 一维线程模型：每个线程处理一个元素
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        // fmaxf -> 单精度浮点最大值函数
+        // 0.0后面的 f 必须加，避免发生隐式类型转换，因为不加则默认为 double 双精度
+        y[idx] = fmaxf(0.0f, x[idx]);
+    }
+}
+```
+
+✅ **写一个 Pytorch C++ 接口，调用 CUDA Kernel**
+
+```cpp
+// 对 Kernel 封装成一个 Python 可以识别的启动函数
+// Python Pytorch 传进来的参数肯定是个 tensor 张量
+// 而且我们的输出肯定也必须是个 tensor 张量
+void relu_f32(torch::Tensor x, torch::Tensor y) {
+    // 检查入参是否为 fp32 单精度浮点数，对应 python 中的 torch.float32
+    if(x.options().dtype() != torch::kFloat32) {
+        std::cout << "Tensor info: " << x.options() << std::endl;
+        throw std::runtime_error("value must be torch::kFloat32\n"); 
+    }
+    if(y.options().dtype() != torch::kFloat32) {
+        std::cout << "Tensor info: " << y.options() << std::endl;
+        throw std::runtime_error("value must be torch::kFloat32\n"); 
+    }
+
+    // 获得输入 x 的维度
+    const int ndim = x.dim();
+    if (ndim == 1 || ndim > 2) {
+        // 如果 x 是一维向量或者大于 2 维的向量，则将其拉平成一维向量
+        int N = 1;
+        for (int i = 0; i < ndim; ++i) {
+            // 遍历向量 x 的每个维度，计算共有多少个元素
+            N *= x.size(i);
+        }
+
+        dim3 block(256);
+        dim3 grid((N + 256 - 1) / 256); // 相当于对 N/256 向上取整，保证 Blcok 的数量够用
+        relu_f32_kernel<<<grid, block>>> (
+            reinterpret_cast<float *>(x.data_ptr()), // 将向量 x (不管是多少维)，强制类型转换成一维的 float *
+            reinterpret_cast<float *>(y.data_ptr()), 
+            N
+        );
+    } else {
+        // 如果 x 是二维向量，可以做一些优化处理
+        int x_dim = x.size(0);
+        int y_dim = y.size(1);
+        int N = x_dim * y_dim;
+        if (x_dim <= MAX_BLOCK_THREAD) {
+            dim3 block(x_dim);
+            dim3 grid(y_dim);
+            relu_f32_kernel<<<grid, block>>> (
+                reinterpret_cast<float *>(x.data_ptr()),
+                reinterpret_cast<float *>(y.data_ptr()), 
+                N
+            );
+        } else {
+            dim3 block(256);
+            dim3 grid((N + 256 - 1) / 256);
+            relu_f32_kernel<<<grid, block>>> (
+                reinterpret_cast<float *>(x.data_ptr()),
+                reinterpret_cast<float *>(y.data_ptr()), 
+                N
+            );
+        }
+    }
+}
+```
+
+✅ **将 Pytorch C++ 接口暴露给 Python**
+
+```cpp
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // m.def("Python调用时的函数名", &C++函数名, "备注")
+    m.def("relu_f32", &relu_f32, "This is a relu_f32_kernel interface ...");
+}
+```
+
+✅ **在 Python 中调用**
+
+```python
+import time
+from typing import Optional
+
+import torch
+from torch.utils.cpp_extension import load
+
+# 禁用反向传播
+torch.set_grad_enabled(False)
+
+# Load the CUDA kernel as a python module
+lib = load(
+    name="relu_lib", # 生成的扩展模块名（Python中import的名称）
+    sources=["relu.cu"], # 待编译的CUDA源文件列表
+    extra_cuda_cflags=[ # 传给nvcc（CUDA编译器）的编译参数
+        "-O3",                           # 最高级别优化（速度优先，推理场景推荐）
+        "-U__CUDA_NO_HALF_OPERATORS__",  # 取消禁用FP16算子（启用半精度运算）
+        "-U__CUDA_NO_HALF_CONVERSIONS__",# 取消禁用FP16类型转换（支持__half类型）
+        "-U__CUDA_NO_HALF2_OPERATORS__", # 取消禁用half2向量运算（SIMD加速）
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",  # 取消禁用BF16类型转换
+        "--expt-relaxed-constexpr",      # 放宽constexpr限制（支持CUDA高级特性）
+        "--expt-extended-lambda",        # 启用CUDA扩展lambda表达式（简化核函数）
+        "--use_fast_math",               # 启用快速数学函数（牺牲少量精度换速度）
+    ],
+    extra_cflags=["-std=c++17"], # 传给C++编译器的参数（启用C++17标准）
+)
+
+# 尝试多种输入、输出维度
+x_dim = [1024, 2048, 4096]
+y_dim = [1024, 2048, 4096]
+xy_dim = [(x, y) for x in x_dim for y in y_dim] # x_dim 和 y_dim 中的元素两两配对，共 9 种组合
+
+for x_dim, y_dim in xy_dim:
+    print("-" * 85)
+    print(" " * 40 + f"x_dim={x_dim}, y_dim={y_dim}")
+
+    # 分配内存
+        # .randn((x_dim, y_dim)) --> 创建 CPU 上的二维随机张量，尺寸为 x_dim * y_dim，数值满足标准正态分布，默认精度为 float32（FP32）
+        # .cuda() --> 将张量从 CPU 转移到 GPU（显存），原 CPU 张量会被垃圾回收（无引用）
+        # .float() --> 强制将张量精度转为 float32（FP32），如果已是 FP32，则无任何操作
+        # .contiguous() --> 确保张量在 GPU 显存中是连续存储的
+        # .zeros_like(input_x) --> 创建和 input_x 尺寸/精度/设备完全一致的全 0 张量（因为 input_x 已在 GPU，所以这一步直接创建在 GPU）
+    input_x = torch.randn((x_dim, y_dim)).cuda().float().contiguous()
+    output_y = torch.zeros_like(input_x).cuda().float().contiguous()
+
+    # 启动 C++ 侧的核函数
+    lib.relu_f32(input_x, output_y)
+
+    # Pytorch 计算的真值
+    th_out = torch.relu(input_x)
+
+    # 查看前 5 个计算结果
+    print(output_y[:5])
+    print(th_out[:5])
+    print('...')
+```
+
+✅ **运行**
+
+```bash
+# 设置环境变量（全局生效）
+env TORCH_CUDA_ARCH_LIST=6.0
+
+# 执行 relu.py 脚本
+python3 relu.py
+```
+
+<img src="./assets/image-20260124204429240.png" alt="image-20260124204429240" width="70%"/>
