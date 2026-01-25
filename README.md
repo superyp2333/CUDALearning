@@ -642,7 +642,7 @@ python3 relu.py
 * 用 **num_embeddings** 表示 embedding_weight 的行数（图中为 20）
 * 用 **emb_dim** 表示列数（图中为 4，即向量维度）
 * 因此，**embedding_weight** 是一个形状为 [num_embeddings, emb_dim] 的二维张量
-* 注意：默认 num_embeddings >= max_token_id，否则数组访问越界
+* ⚠️ 默认 num_embeddings >= max_token_id，否则数组访问越界
 
 <img src="./assets/image-20260125151909682.png" alt="image-20260125151909682.png" width="95%"/>
 
@@ -683,7 +683,7 @@ __global__ void embedding_f32_kernel(int *input, float *weight, float *output, i
 }
 ```
 
-✅ **4个一组的 FP32**
+✅ **FP32：一个线程处理 4 个元素，连续访存更易触发 GPU 的 “合并访存” 优化**
 
 线程模型：
 
@@ -712,7 +712,7 @@ __global__ void embedding_f32x4_kernel(int *input, float *weight, float *output,
 }
 ```
 
-✅ **4个一组的 FP32，进一步优化**
+✅ **FP32：一个线程处理 4 个元素，进一步优化，一次性读取 4 个 float **
 
 > 每回手动赋值 4 次 float 类型的元素太慢了
 
@@ -754,7 +754,7 @@ __global__ void embedding_f16_kernel(int *input, half *weight, half *output, int
 }
 ```
 
-✅ **8个一组的 FP16**
+✅ **FP16：一个线程处理 8 个元素**
 
 每个 FP16 元素只占 2 个字节，所以 GPU 一次可以处理 8 个元素
 
@@ -794,9 +794,9 @@ __global__ void embedding_f16x8_kernel(int *input, half *weight, half *output, i
 }
 ```
 
-✅ **8个一组的 FP16，进一步优化**
+✅ **FP16：一个线程处理 8 个元素，进一步优化**
 
-用 2 个 half，拼成一个 float
+用 2 个 half，拼成一个 float，一次性加载所有内存
 
 ```cpp
 // FP16 x 8  进一步优化访存效率，单次指令读写 4 个 float 元素，相当于 8 个 haf 元素
@@ -813,4 +813,237 @@ __global__ void embedding_f16x8_pack_kernel(int *input, half *weight, half *outp
 
 ✅ **运行结果：比 pytorch 的快**
 
+> 注意：4个一组，虽然访存次数变少了，但是不一定会更快，因为每个线程干的活更多了
+
 ![image-20260125183745412](./assets/image-20260125183745412.png)
+
+### 4.4 Elu算子
+
+<img src="./assets/image-20260125185149417.png" alt="image-20260125185149417" width="60%"/>
+
+✅ **不同精度的 ELU 计算函数**
+
+```cpp
+// FP32
+// __device__：只能在 GPU 侧调用     __global__ CPU 和 GPU 都可以调用
+// __forceinline__：内联函数，即让编译器强制将该函数嵌入至调用处，消除函数调用的开销，提高性能
+// 0.f 和 0.0f：这两种写法都对，都代表单精度，但是不能写成 0.0，因为这代表双精度，可能会引入精度问题
+// expf：CUDA 内置的单精度浮点指数函数（比标准exp更适配 GPU）
+__device__ __forceinline__ float elu(float x) {
+  return x > 0.f ? x : ALPHA * (expf(x) - 1.f);
+}
+
+// FP16
+// __hgt(a, b)：CUDA 内置半精度比较函数
+// __hmul(...)：CUDA 内置半精度乘法函数
+// __float2half：将 float 型的 ALPHA（如 1.0f）转换为 half 型，确保参与计算的是同类型（避免隐式转换）
+__device__ __forceinline__ half elu_half(half x) {
+  return __hgt(x, __float2half(0.f))
+             ? x
+             : __hmul(__float2half(ALPHA), __hsub(hexp(x), __float2half(1.f)));
+}
+```
+
+✅ **F32 精度**
+
+* 计算精度：FP32，单精度，每个元素占 4 个字节
+* 输入向量 x 的维度：N
+* 输出向量 y 的维度：N
+* 线程模型：每个线程只处理一个元素：每个 block `256` 个线程，则共需要 `N/256` 个 block
+
+```cpp
+// FP32
+// y = elu(x)
+// x: N  y:N
+// grid(N/256) block(256)
+__global__ void elu_f32_kernel(float *x, float *y, int N) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < N)
+    y[tid] = elu(x[tid]);
+}
+```
+
+* 线程模型：每个线程处理 4 个元素：每个 block `256/4` 个线程，还是需要 `N/256` 个 block
+
+> 优化点：一次性加载 4 个 float 元素，减少访存
+
+```cpp
+// FP32 x 4
+// y = elu(x)
+// x: N  y:N
+// grid(N/256) block(256/4)
+// 这里 gird(N/256) 是没问题的！因为每个 block 还是处理了 256 个元素，只不过一个线程干了很多的活！
+__global__ void elu_f32x4_kernel(float *x, float *y, int N) {
+  // 前面已经处理了多少个元素
+  int offset_thd = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (idx < N) {
+    // 开一个寄存器，保存 4个连续的 float 元素，第一个元素的位置为 offset_thd
+    float4 reg_x = FLOAT4(x[offset_thd]);
+    float4 reg_y;
+
+    // 对这 4 个连续的元素进行 elu 计算
+    reg_y.x = elu(reg_x.x);
+    reg_y.y = elu(reg_x.y);
+    reg_y.z = elu(reg_x.z);
+    reg_y.w = elu(reg_x.w);
+
+    // 将计算结果写入输出
+    FLOAT4(y[idx]) = reg_y;
+  }
+}
+```
+
+
+
+✅ **F16 精度**
+
+* 计算精度：FP16，每个元素占 2 个字节
+* 输入向量 x 的维度：N
+* 输出向量 y 的维度：N
+* 线程模型：每个线程只处理一个元素：每个 block `256` 个线程，则共需要 `N/256` 个 block
+
+```cpp
+// FP16
+// y = elu_half(x)
+// x: N  y:N
+// grid(N/256) block(256)
+__global__ void elu_f16_kernel(half *x, half *y, int N) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < N)
+    y[tid] = elu_half(x[tid]);
+}
+```
+* 每个线程处理 2 个元素：每个 block `256/2` 个线程，还是需要 `N/256` 个 block
+
+> 优化点：一次性加载 2 个 half 元素，减少访存
+
+```cpp
+// FP16 x 2
+// y = elu_half(x)
+// x: N  y:N
+// grid(N/256) block(256/2)
+__global__ void elu_f16x2_kernel(half *x, half *y, int N) {
+  // 前面已经处理了多少个元素
+  int offset_thd = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+  if (offset_thd < N) {
+    // 开一个寄存器，保存 2 个连续的 half 元素，第一个元素的位置为 offset_thd
+    half2 reg_x = HALF2(x[offset_thd]);
+    half2 reg_y;
+    // 对这 2 个连续的元素进行 elu 计算
+    reg_y.x = elu_half(reg_x.x);
+    reg_y.y = elu_half(reg_x.y);
+
+    // 将计算结果写入输出
+    HALF2(y[offset_thd]) = reg_y;
+  }
+}
+```
+* 每个线程处理 8 个元素：每个 block `256/8` 个线程，还是需要 `N/256` 个 block
+
+> 优化点：一次加载 2 个 half 元素，但是连续加载 4 次，更易触发 gpu 的合并优化
+
+```cpp
+// FP16 x 8
+// y = elu_half(x)
+// x: N  y:N
+// grid(N/256) block(256/8)
+__global__ void elu_f16x8_kernel(half *x, half *y, int N) {
+  // 前面已经处理了多少个元素
+  int offset_thd = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+
+  // 开 4 个寄存器，保存 8 个连续的 half 元素，第一个元素的位置为 offset_thd
+  half2 reg_x_0 = HALF2(x[offset_thd + 0]);
+  half2 reg_x_1 = HALF2(x[offset_thd + 2]);
+  half2 reg_x_2 = HALF2(x[offset_thd + 4]);
+  half2 reg_x_3 = HALF2(x[offset_thd + 6]);
+
+  half2 reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+  reg_y_0.x = elu_half(reg_x_0.x);
+  reg_y_0.y = elu_half(reg_x_0.y);
+  reg_y_1.x = elu_half(reg_x_1.x);
+  reg_y_1.y = elu_half(reg_x_1.y);
+  reg_y_2.x = elu_half(reg_x_2.x);
+  reg_y_2.y = elu_half(reg_x_2.y);
+  reg_y_3.x = elu_half(reg_x_3.x);
+  reg_y_3.y = elu_half(reg_x_3.y);
+  if ((offset_thd + 0) < N) {
+    HALF2(y[offset_thd + 0]) = reg_y_0;
+  }
+  if ((offset_thd + 2) < N) {
+    HALF2(y[offset_thd + 2]) = reg_y_1;
+  }
+  if ((offset_thd + 4) < N) {
+    HALF2(y[offset_thd + 4]) = reg_y_2;
+  }
+  if ((offset_thd + 6) < N) {
+    HALF2(y[offset_thd + 6]) = reg_y_3;
+  }
+}
+```
+
+* 每个线程处理 8 个元素：每个 block `256/8` 个线程，还是需要 `N/256` 个 block
+
+> 优化点：分别把输入、输出的 4 次加载显存，通过强制类型转换实现一次访存代替
+
+```cpp
+// FP16 x 8 pack
+// y = elu_half(x)
+// x: N  y:N
+// grid(N/256) block(256/8)
+__global__ void elu_f16x8_pack_kernel(half *x, half *y, int N) {
+  // 前面已经处理了多少个元素
+  int offset_thd = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+
+  // 一次性加载缓存
+  half2 reg_x[4], reg_y[4];
+  FLOAT4(reg_x[0]) = FLOAT4(x[offset_thd]);
+
+  reg_y[0].x = elu_half(reg_x[0].x);
+  reg_y[0].y = elu_half(reg_x[0].y);
+  reg_y[1].x = elu_half(reg_x[1].x);
+  reg_y[1].y = elu_half(reg_x[1].y);
+  reg_y[2].x = elu_half(reg_x[2].x);
+  reg_y[2].y = elu_half(reg_x[2].y);
+  reg_y[3].x = elu_half(reg_x[3].x);
+  reg_y[3].y = elu_half(reg_x[3].y);
+
+  // 一次性加载缓存
+  if (offset_thd < N) {
+    FLOAT4(y[offset_thd]) = FLOAT4(reg_y[0]);
+  }
+}
+```
+
+✅ **运行结果**
+
+<img src="./assets/image-20260125211007819.png" alt="image-20260125211007819" width="80%" />
+
+### 4.5 访存的理解
+
+> **“一次访存” = GPU 发起的一次完整的 “内存事务（Memory Transaction）”**，而非代码里写的一行赋值 / 加载语句
+
+假设代码里写了4行加载语句（4行代码）
+
+* 代码层面：4 行加载，看起来是 “4 次操作”
+* GPU 硬件层面：如果这 4 个地址是**连续且对齐**（0->2->4->6），GPU 内存控制器会把这 4 次请求**合并成 1 次内存事务**，这就是 “一次访存”
+
+```cpp
+half2 reg_x0 = HALF2(x[0]);
+half2 reg_x1 = HALF2(x[2]);
+half2 reg_x2 = HALF2(x[4]);
+half2 reg_x3 = HALF2(x[6]);
+```
+
+
+
+所以上下这2种情况，在理想状况下，都会被合并成一次内存事务
+
+```cpp
+  // 一次性加载缓存
+  half2 reg_x[4], reg_y[4];
+  FLOAT4(reg_x[0]) = FLOAT4(x[offset_thd]);
+```
+
+
+
+那为啥下面这种速度更快呢？可能是第二种写法对应的指令更少
