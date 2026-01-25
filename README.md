@@ -821,6 +821,10 @@ __global__ void embedding_f16x8_pack_kernel(int *input, half *weight, half *outp
 
 <img src="./assets/image-20260125185149417.png" alt="image-20260125185149417" width="60%"/>
 
+[elu.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/elu/elu.cu)
+
+[elu.py](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/elu/elu.py)
+
 ✅ **不同精度的 ELU 计算函数**
 
 ```cpp
