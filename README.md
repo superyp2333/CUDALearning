@@ -432,6 +432,8 @@ Warp Divergence 是 SIMT（单指令多线程）模式下的特有现象：
 
 ## 四、算子实战
 
+
+
 ### 4.1 简单的程序
 
 [tensor_add.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/tensor_add.cu)
@@ -625,3 +627,190 @@ python3 relu.py
 ```
 
 <img src="./assets/image-20260124204429240.png" alt="image-20260124204429240" width="70%"/>
+
+### 4.3 Emedding算子
+
+> **核心目标**：将离散的 ID 输入（例如 NLP 中的文本 token、短视频推荐中的视频类目 ID）映射到连续空间中的 embedding 向量
+
+映射过程如下：
+
+* 对于每个输入的 ID，ID 的值为索引，在 embedding_weight 中查找对应的行，将该行作为该 ID 映射的 embedding 向量
+* 映射关系：`input[idx]` -> embedding_weight[`input[idx]`]
+
+数据结构解析：
+
+* 用 **num_embeddings** 表示 embedding_weight 的行数（图中为 20）
+* 用 **emb_dim** 表示列数（图中为 4，即向量维度）
+* 因此，**embedding_weight** 是一个形状为 [num_embeddings, emb_dim] 的二维张量
+* 注意：默认 num_embeddings >= max_token_id，否则数组访问越界
+
+<img src="./assets/image-20260125151909682.png" alt="image-20260125151909682.png" width="95%"/>
+
+[embedding.cu](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/embedding/embedding.cu)
+
+[embedding.py](https://github.com/superyp2333/CUDALearning/blob/master/cudaDemo/embedding/embedding.py)
+
+✅ **FP32 精度**
+
+* 计算精度：FP32，每个元素占 4 个字节
+* 输入向量 input：维度 = 句子的长度 seq_len，`长度可能非常大，几十万上百万`
+* 输入向量 weight：维度 = （max_token_id, emb_dim）
+* 输出向量 output：维度 = （seq_len, emb_dim）
+* 线程模型：
+  * 1 个 block 负责一个 ID 的整行读取，因此一个 thread 负责读取该行的一个元素
+  * 因此一共需要 seq_len 个 block
+
+```cpp
+output数组下标：  0        1        2        3        4        5        6        7        8   
+对应线程：      └线程0┘  └线程1┘   └线程2┘  └线程3┘   └线程4┘   └线程5┘   └线程6┘  └线程7┘   └线程8┘
+写入内容：     W[ID][0] W[ID][1] W[ID][2] W[ID][3] W[ID][4] W[ID][5] W[ID][6] W[ID][7] W[ID][8] 
+```
+
+```cpp
+// FP32
+// input: seq_len  weight: (max_token_id, emb_dim)   emb_dim < 1024
+// output: (seq_len, emb_dim)
+// grid(seq_len) block(emb_dim)
+// 前提条件：emb_dim < 1024
+__global__ void embedding_f32_kernel(int *input, float *weight, float *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+    int tx = threadIdx.x;
+
+    // CUDA 中不支持用[][]直接索引显存，因为 float * 指向的内存是一维排列的
+    int offset = input[bx] * emb_dim; // 当前线程所读取的 weight 行的行首元素的位置
+    output[tid] = weight[offset + tx];
+}
+```
+
+✅ **4个一组的 FP32**
+
+线程模型：
+
+* 1 个 block 负责一个 ID 的整行读取，但每个 thread 读取该行的 4 个元素
+* 因此每个 block 所需的线程数量 = emb_dim/4
+
+```cpp
+output数组下标： 0  1  2  3  | 4  5  6  7  | 8  9  10 11 | 12 13 14 15
+对应线程：       └──线程0──┘   └──线程1───┘   └──线程2───┘   └──线程3───┘
+写入内容：       W[ID][0]~3    W[ID][4]~7    W[ID][8]~11  W[ID][12]~15
+```
+
+```cpp
+// FP32 x 4  优化访存效率，每个线程每次处理 4 个元素
+// grid(seq_len)  block(emb_dim / 4)
+__global__ void embedding_f32x4_kernel(int *input, float *weight, float *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+
+    int offset = input[bx] * emb_dim; // 当前线程所读取的 weight 行的行首元素的位置
+    int offset_thd = threadIdx.x * 4;  // 当前行已经读了多少个位置
+    output[tid] = weight[offset + offset_thd];
+    output[tid + 1] = weight[offset + offset_thd + 1];
+    output[tid + 2] = weight[offset + offset_thd + 2];
+    output[tid + 3] = weight[offset + offset_thd + 3];
+}
+```
+
+✅ **4个一组的 FP32，进一步优化**
+
+> 每回手动赋值 4 次 float 类型的元素太慢了
+
+可以使用 CUDA 内置的 `float4` 的数据类型，等价于 `strcut {float x, y, z, w}`，相当于一次性存了 4 个 float 元素
+
+```cpp
+// 将 float 类型的地址强制转换为 float4 类型的指针
+// -> 本质是告诉编译器：“把从这个地址开始的连续 4 个 float，当作 1 个 float4 来处理”
+#define FLOAT4(value) (reinterpret_cast<float4 *>(&(value))[0])
+```
+
+```cpp
+// FP32 x 4  进一步优化访存效率，单次指令读写 4 个 float 元素，比手动写 4 行赋值语句更高效
+// grid(seq_len)  block(emb_dim / 4)
+__global__ void embedding_f32x4_pack_kernel(int *input, float *weight, float *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+
+    int offset = input[bx] * emb_dim; // 当前线程所读取的 weight 行的行首元素的位置
+    int offset_thd = threadIdx.x * 4;  // 当前行已经读了多少个位置
+    FLOAT4(output[bx * emb_dim + offset_thd]) = FLOAT4(weight[offset + offset_thd]);
+}
+```
+
+✅ **FP16 精度**
+
+写法和 FP32 是一模一样的，只不过每个元素占的内存从 4 字节，变成了 2 字节，精度降低了
+
+```cpp
+// FP16
+// grid(seq_len) block(emb_dim)
+__global__ void embedding_f16_kernel(int *input, half *weight, half *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+    int tx = threadIdx.x;
+
+    int offset = input[bx] * emb_dim;
+    output[tid] = weight[offset + tx];
+}
+```
+
+✅ **8个一组的 FP16**
+
+每个 FP16 元素只占 2 个字节，所以 GPU 一次可以处理 8 个元素
+
+> **GPU 读写显存的核心特性：**
+>
+> 无论读写什么数据类型，**GPU 内存控制器**每次都按**固定的总线宽度（主流架构为128 位，16字节）**发起一次 “Memory Transaction”
+>
+> 哪怕你只需要读 1 个 float，GPU 也会先读 128 位数据到缓存，再从中提取你需要的 1 个 float
+>
+> 
+>
+> 因此，**为了最大化的利用访存效率**，每次读取最优的数量
+>
+> -> FP16 单元素占 16 位（2 字节），8 个 FP16 正好填满 128 位总线
+>
+> -> FP32 单元素占 32 位（4 字节），4 个就能填满
+>
+> 这是硬件层面的 “总线对齐” 要求，而非人为设计
+
+```cpp
+// FP16 x 8  
+// grid(seq_len)  block(emb_dim / 8)
+__global__ void embedding_f16x8_kernel(int *input, half *weight, half *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+
+    int offset = input[bx] * emb_dim; // 当前线程所读取的 weight 行的行首元素的位置
+    int offset_thd = threadIdx.x * 8;  // 当前行已经读了多少个位置
+    output[tid] = weight[offset + offset_thd];
+    output[tid + 1] = weight[offset + offset_thd + 1];
+    output[tid + 2] = weight[offset + offset_thd + 2];
+    output[tid + 3] = weight[offset + offset_thd + 3];
+    output[tid + 4] = weight[offset + offset_thd + 4];
+    output[tid + 5] = weight[offset + offset_thd + 5];
+    output[tid + 6] = weight[offset + offset_thd + 6];
+    output[tid + 7] = weight[offset + offset_thd + 7];
+}
+```
+
+✅ **8个一组的 FP16，进一步优化**
+
+用 2 个 half，拼成一个 float
+
+```cpp
+// FP16 x 8  进一步优化访存效率，单次指令读写 4 个 float 元素，相当于 8 个 haf 元素
+// grid(seq_len)  block(emb_dim / 8)
+__global__ void embedding_f16x8_pack_kernel(int *input, half *weight, half *output, int seq_len, int emb_dim) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x;
+
+    int offset = input[bx] * emb_dim; // 当前线程所读取的 weight 行的行首元素的位置
+    int offset_thd = threadIdx.x * 8;  // 当前行已经读了多少个位置
+    FLOAT4(output[bx * emb_dim + offset_thd]) = FLOAT4(weight[offset + offset_thd]);
+}
+```
+
+✅ **运行结果：比 pytorch 的快**
+
+![image-20260125183745412](./assets/image-20260125183745412.png)
